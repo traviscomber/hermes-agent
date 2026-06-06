@@ -436,6 +436,37 @@ class TestTzdataDependencyDeclared:
 
 
 # ---------------------------------------------------------------------------
+# PowerShell installer invariants
+# ---------------------------------------------------------------------------
+
+
+class TestWindowsInstallerSanitizesInheritedPythonEnv:
+    """The PowerShell installer must neutralize inherited Python env vars."""
+
+    def test_install_ps1_clears_pythonpath_and_pythonhome(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "scripts" / "install.ps1").read_text(encoding="utf-8")
+        assert "function Clear-InheritedPythonEnv" in source
+        assert "function Restore-InheritedPythonEnv" in source
+        assert "Env:PYTHONPATH" in source, (
+            "install.ps1 must clear inherited PYTHONPATH so uv / venv imports "
+            "cannot be redirected into another checkout"
+        )
+        assert "Env:PYTHONHOME" in source, (
+            "install.ps1 must clear inherited PYTHONHOME so the venv "
+            "interpreter resolves its own stdlib and site-packages"
+        )
+        assert source.count("Clear-InheritedPythonEnv") >= 2, (
+            "install.ps1 must invoke the inherited-Python-env sanitizer, not "
+            "just define it"
+        )
+        assert "Restore-InheritedPythonEnv" in source and "finally" in source, (
+            "install.ps1 must restore the caller's PYTHONPATH/PYTHONHOME after "
+            "the install run finishes"
+        )
+
+
+# ---------------------------------------------------------------------------
 # README / docs consistency
 # ---------------------------------------------------------------------------
 

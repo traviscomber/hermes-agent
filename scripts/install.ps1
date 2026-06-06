@@ -185,6 +185,48 @@ function Write-Err {
     Write-Host "[X] $Message" -ForegroundColor Red
 }
 
+function Clear-InheritedPythonEnv {
+    # Guard against environment leakage when the installer is launched from
+    # another Python-driven tool session (for example Hermes terminal tools or
+    # an IDE shell). Inherited PYTHONPATH/PYTHONHOME can force uv or the venv
+    # interpreter to import from a different checkout/interpreter than the one
+    # we're bootstrapping, which makes fresh installs look broken even when
+    # dependency sync succeeded.
+    $script:OriginalPythonEnv = @{
+        HasPythonPath = $null -ne (Get-Item Env:PYTHONPATH -ErrorAction SilentlyContinue)
+        PythonPath    = $env:PYTHONPATH
+        HasPythonHome = $null -ne (Get-Item Env:PYTHONHOME -ErrorAction SilentlyContinue)
+        PythonHome    = $env:PYTHONHOME
+    }
+    if ($env:PYTHONPATH) {
+        Write-Warn "Ignoring inherited PYTHONPATH during install to avoid module shadowing"
+        Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+    }
+    if ($env:PYTHONHOME) {
+        Write-Warn "Ignoring inherited PYTHONHOME during install"
+        Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue
+    }
+}
+
+function Restore-InheritedPythonEnv {
+    if (-not $script:OriginalPythonEnv) {
+        return
+    }
+    if ($script:OriginalPythonEnv.HasPythonPath) {
+        $env:PYTHONPATH = $script:OriginalPythonEnv.PythonPath
+    } else {
+        Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+    }
+    if ($script:OriginalPythonEnv.HasPythonHome) {
+        $env:PYTHONHOME = $script:OriginalPythonEnv.PythonHome
+    } else {
+        Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue
+    }
+    $script:OriginalPythonEnv = $null
+}
+
+Clear-InheritedPythonEnv
+
 # --- Ensure-mode helpers ---
 
 function Resolve-NpmCmd {
@@ -2890,64 +2932,69 @@ function Main {
 # structured JSON error frame instead of a bare exception.
 
 try {
-    if ($Ensure -ne "") {
-        if ($PSBoundParameters.ContainsKey("Stage")) {
-            Write-Err "Cannot use -Ensure and -Stage simultaneously"
-            exit 1
-        }
-        Invoke-EnsureMode -Deps $Ensure
-        exit 0
-    }
-    if ($PostInstall) {
-        Invoke-PostInstallMode
-        exit 0
-    }
-
-    if ($ProtocolVersion) {
-        Write-Output $InstallStageProtocolVersion
-        exit 0
-    }
-
-    if ($Manifest) {
-        $payload = @{
-            protocol_version = $InstallStageProtocolVersion
-            stages = @($InstallStages | ForEach-Object {
-                @{
-                    name             = $_.Name
-                    title            = $_.Title
-                    category         = $_.Category
-                    needs_user_input = $_.NeedsUserInput
-                }
-            })
-        }
-        $payload | ConvertTo-Json -Depth 5 -Compress | Write-Output
-        exit 0
-    }
-
-    # Use PSBoundParameters rather than $Stage truthiness so that an
-    # explicit `-Stage ""` from a misbehaving driver doesn't fall through
-    # to the full-install Main path and silently kick off a destructive
-    # operation.  Empty string is a contract violation; surface it as
-    # unknown-stage exit 2 with a structured JSON frame.
-    if ($PSBoundParameters.ContainsKey("Stage")) {
-        $def = Get-InstallStage -Name $Stage
-        if (-not $def) {
-            $err = @{
-                ok     = $false
-                stage  = $Stage
-                reason = "unknown stage: $Stage. Run install.ps1 -Manifest to list valid stages."
+    try {
+        if ($Ensure -ne "") {
+            if ($PSBoundParameters.ContainsKey("Stage")) {
+                Write-Err "Cannot use -Ensure and -Stage simultaneously"
+                exit 1
             }
-            $err | ConvertTo-Json -Compress | Write-Output
-            exit 2
+            Invoke-EnsureMode -Deps $Ensure
+            exit 0
         }
-        Step-OutOfInstallDir
-        Invoke-Stage -StageDef $def
-        exit 0
-    }
 
-    # Default: full install (today's behavior, plus optional -NonInteractive
-    # and -Json layered on by the params above).
-    Main
+        if ($PostInstall) {
+            Invoke-PostInstallMode
+            exit 0
+        }
+
+        if ($ProtocolVersion) {
+            Write-Output $InstallStageProtocolVersion
+            exit 0
+        }
+
+        if ($Manifest) {
+            $payload = @{
+                protocol_version = $InstallStageProtocolVersion
+                stages = @($InstallStages | ForEach-Object {
+                    @{
+                        name             = $_.Name
+                        title            = $_.Title
+                        category         = $_.Category
+                        needs_user_input = $_.NeedsUserInput
+                    }
+                })
+            }
+            $payload | ConvertTo-Json -Depth 5 -Compress | Write-Output
+            exit 0
+        }
+
+        # Use PSBoundParameters rather than $Stage truthiness so that an
+        # explicit `-Stage ""` from a misbehaving driver doesn't fall through
+        # to the full-install Main path and silently kick off a destructive
+        # operation.  Empty string is a contract violation; surface it as
+        # unknown-stage exit 2 with a structured JSON frame.
+        if ($PSBoundParameters.ContainsKey("Stage")) {
+            $def = Get-InstallStage -Name $Stage
+            if (-not $def) {
+                $err = @{
+                    ok     = $false
+                    stage  = $Stage
+                    reason = "unknown stage: $Stage. Run install.ps1 -Manifest to list valid stages."
+                }
+                $err | ConvertTo-Json -Compress | Write-Output
+                exit 2
+            }
+            Step-OutOfInstallDir
+            Invoke-Stage -StageDef $def
+            exit 0
+        }
+
+        # Default: full install (today's behavior, plus optional -NonInteractive
+        # and -Json layered on by the params above).
+        Main
+    } finally {
+        Restore-InheritedPythonEnv
+    }
 } catch {
     if ($Json -or $Stage) {
         # Stage-driver mode: caller wants JSON they can parse.  Emit a
